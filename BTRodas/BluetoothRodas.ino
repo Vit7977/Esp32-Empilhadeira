@@ -1,134 +1,409 @@
-/*
-  Empilhadeira - controle por Bluetooth (BLE) pelo app (ESP32 + L298N)
 
-  Como funciona:
-  - O ESP anuncia o Bluetooth com o nome "Empilhadeira".
-  - O app (aba Joystick) procura esse nome, conecta e envia "x,y,elevacao" ~10x por segundo.
-    x: -100 (esquerda) a 100 (direita)   y: -100 (ré) a 100 (frente)
-  - Se os comandos pararem de chegar (Bluetooth caiu, app fechou), os motores param sozinhos.
-  - Ao desconectar, o ESP volta a anunciar para o app conseguir reconectar.
-
-  Não precisa instalar biblioteca: o BLE já vem no pacote "esp32" da Arduino IDE.
-  IMPORTANTE: o nome e os UUIDs abaixo precisam ser iguais aos do app (src/features/Joystick/joystick.ble.js).
-*/
-
+#include <Arduino.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 
-// ================== CONFIGURAÇÃO ==================
-#define NOME_BLE      "Empilhadeira"
-#define SERVICO_UUID  "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-#define COMANDO_UUID  "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+// ============================================
+// 1. CONFIGURACOES BLUETOOTH
+// ============================================
 
-// Pinos do L298N  >>> TROQUE PELOS PINOS QUE VOCÊ USA <<<
-// Tire os jumpers de ENA e ENB do L298N para o controle de velocidade funcionar.
-const int ENA = 5, IN1 = 6, IN2 = 7;   // motor esquerdo
-const int ENB = 10, IN3 = 8, IN4 = 9;   // motor direito
+#define BLE_NAME "EMPILHADEIRA_ESP32"
 
-const int PWM_MIN = 110;   // abaixo disso o motor não sai do lugar; ajuste se precisar
-const int PWM_MAX = 255;   // velocidade máxima (reduza para deixar mais lenta)
-const unsigned long TIMEOUT_MS = 500;   // para os motores se ficar sem comando
-// ==================================================
+#define SERVICE_UUID \
+  "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 
-// Último comando recebido (escrito pelo Bluetooth, lido no loop)
-volatile int cmdX = 0, cmdY = 0;
+#define CHARACTERISTIC_UUID \
+  "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+BLEServer* bleServer = nullptr;
+
+volatile bool bluetoothConectado = false;
+volatile bool reiniciarBluetooth = false;
+
+// ============================================
+// 2. PINOS L298N
+// ============================================
+
+// Motor esquerdo
+#define ENA 5
+#define IN1 6
+#define IN2 7
+
+// Motor direito
+#define ENB 10
+#define IN3 8
+#define IN4 9
+
+// ============================================
+// 3. CONFIGURACOES DOS MOTORES
+// ============================================
+
+// PWM: 0 a 255
+const int PWM_MAX = 160;
+
+// Frequencia PWM
+const int PWM_FREQ = 1000;
+
+// Resolucao PWM (8 bits)
+const int PWM_RESOLUTION = 8;
+
+// Zona morta do joystick (%)
+const int DEAD_ZONE = 8;
+
+// Inverte a direcao caso necessario
+const bool INVERTER_ESQUERDO = false;
+const bool INVERTER_DIREITO = false;
+
+// Ultimas velocidades aplicadas
+int velocidadeAnteriorEsq = 0;
+int velocidadeAnteriorDir = 0;
+
+// ============================================
+// 4. VARIAVEIS DO JOYSTICK
+// ============================================
+
+// Valores entre -100 e 100
+volatile int joystickX = 0;
+volatile int joystickY = 0;
+
+// Tempo do ultimo comando valido
 volatile unsigned long ultimoComando = 0;
-volatile bool conectado = false;
-bool estavaConectado = false;
 
-// v vai de -1 (ré total) a 1 (frente total)
-void motor(int en, int a, int b, float v) {
-  if (fabs(v) < 0.08) {          // zona morta: parado
-    digitalWrite(a, LOW);
-    digitalWrite(b, LOW);
-    analogWrite(en, 0);
-    return;
+// Parada automatica apos 450 ms
+const unsigned long TIMEOUT_COMANDO = 450;
+
+// ============================================
+// 5. CONTROLE DOS MOTORES
+// ============================================
+
+// velocidade: -100 a 100
+void controlarMotor(
+  int enable,
+  int inA,
+  int inB,
+  int velocidade
+) {
+  velocidade = constrain(velocidade, -100, 100);
+
+  // Desativa o PWM antes de alterar a direcao
+  ledcWrite(enable, 0);
+
+  if (velocidade > 0) {
+    // Frente
+    digitalWrite(inA, HIGH);
+    digitalWrite(inB, LOW);
+
+  } else if (velocidade < 0) {
+    // Re
+    digitalWrite(inA, LOW);
+    digitalWrite(inB, HIGH);
+
+  } else {
+    // Parado
+    digitalWrite(inA, LOW);
+    digitalWrite(inB, LOW);
   }
-  digitalWrite(a, v > 0 ? HIGH : LOW);
-  digitalWrite(b, v > 0 ? LOW : HIGH);
-  analogWrite(en, PWM_MIN + (int)((PWM_MAX - PWM_MIN) * fabs(v)));
+
+  int pwm = map(
+    abs(velocidade),
+    0, 100,
+    0, PWM_MAX
+  );
+
+  ledcWrite(enable, pwm);
 }
 
-// x: -1 esquerda / 1 direita   y: -1 ré / 1 frente
-void dirigir(float x, float y) {
-  float esq = constrain(y + x, -1.0f, 1.0f);
-  float dir = constrain(y - x, -1.0f, 1.0f);
-  motor(ENA, IN1, IN2, esq);
-  motor(ENB, IN3, IN4, dir);
+// ============================================
+// 6. PARAR MOTORES
+// ============================================
+
+void pararMotores() {
+  // Desabilita os motores
+  ledcWrite(ENA, 0);
+  ledcWrite(ENB, 0);
+
+  // Coloca as entradas em nivel baixo
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+
+  velocidadeAnteriorEsq = 0;
+  velocidadeAnteriorDir = 0;
 }
 
-class ServidorCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* servidor) {
-    conectado = true;
+// ============================================
+// 7. CONTROLE PELO JOYSTICK
+// ============================================
+
+void controlarJoystick(int x, int y) {
+  x = constrain(x, -100, 100);
+  y = constrain(y, -100, 100);
+
+  // Zona morta para evitar movimentos
+  // involuntarios proximo do centro
+  if (abs(x) <= DEAD_ZONE) x = 0;
+  if (abs(y) <= DEAD_ZONE) y = 0;
+
+  // Mistura diferencial:
+  // Y controla frente/re
+  // X controla direcao
+  int velocidadeEsq = y + x;
+  int velocidadeDir = y - x;
+
+  // Normaliza para preservar a proporcao
+  // entre os dois motores
+  int maior = max(
+    100,
+    max(abs(velocidadeEsq), abs(velocidadeDir))
+  );
+
+  velocidadeEsq = velocidadeEsq * 100 / maior;
+  velocidadeDir = velocidadeDir * 100 / maior;
+
+  // Inversao opcional dos motores
+  if (INVERTER_ESQUERDO) {
+    velocidadeEsq = -velocidadeEsq;
   }
 
-  void onDisconnect(BLEServer* servidor) {
-    conectado = false;
-    cmdX = 0;
-    cmdY = 0;
+  if (INVERTER_DIREITO) {
+    velocidadeDir = -velocidadeDir;
+  }
+
+  // Atualiza apenas quando a velocidade muda
+  if (velocidadeEsq != velocidadeAnteriorEsq) {
+    controlarMotor(
+      ENA, IN1, IN2,
+      velocidadeEsq
+    );
+
+    velocidadeAnteriorEsq = velocidadeEsq;
+  }
+
+  if (velocidadeDir != velocidadeAnteriorDir) {
+    controlarMotor(
+      ENB, IN3, IN4,
+      velocidadeDir
+    );
+
+    velocidadeAnteriorDir = velocidadeDir;
+  }
+}
+
+// ============================================
+// 8. EVENTOS DA CONEXAO BLE
+// ============================================
+
+class BluetoothCallbacks : public BLEServerCallbacks {
+
+  void onConnect(BLEServer* server) override {
+    joystickX = 0;
+    joystickY = 0;
+    ultimoComando = 0;
+
+    bluetoothConectado = true;
+    reiniciarBluetooth = false;
+
+    Serial.println("[BLE] Celular conectado!");
+  }
+
+  void onDisconnect(BLEServer* server) override {
+    bluetoothConectado = false;
+
+    joystickX = 0;
+    joystickY = 0;
+    ultimoComando = 0;
+
+    reiniciarBluetooth = true;
+
+    Serial.println("[BLE] Celular desconectado!");
   }
 };
+
+// ============================================
+// 9. RECEBER COMANDOS DO APP
+// ============================================
 
 class ComandoCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* caracteristica) {
-    String valor = caracteristica->getValue().c_str();
 
-    // A elevação (3º valor) é ignorada por enquanto: não há motor de garfo
-    int x = 0, y = 0;
-    if (sscanf(valor.c_str(), "%d,%d", &x, &y) == 2) {
-      cmdX = constrain(x, -100, 100);
-      cmdY = constrain(y, -100, 100);
-      ultimoComando = millis();
+  void onWrite(BLECharacteristic* characteristic) override {
+
+    if (!bluetoothConectado) return;
+
+    String comando = characteristic->getValue();
+
+    int x = 0;
+    int y = 0;
+    char caractereExtra;
+
+    // Formato esperado: "X,Y"
+    // Exemplo: "20,80"
+    int resultado = sscanf(
+      comando.c_str(),
+      " %d , %d %c",
+      &x,
+      &y,
+      &caractereExtra
+    );
+
+    // Rejeita formatos incorretos e
+    // valores fora do intervalo
+    if (resultado != 2 ||
+        x < -100 || x > 100 ||
+        y < -100 || y > 100) {
+      Serial.println("[BLE] Comando invalido");
+      return;
     }
+
+    joystickX = x;
+    joystickY = y;
+    ultimoComando = millis();
+
+    Serial.printf(
+      "[JOYSTICK] X: %d | Y: %d\n",
+      x, y
+    );
   }
 };
+
+// ============================================
+// 10. CONFIGURAR BLUETOOTH
+// ============================================
+
+void iniciarBluetooth() {
+  BLEDevice::init(BLE_NAME);
+
+  bleServer = BLEDevice::createServer();
+
+  bleServer->setCallbacks(
+    new BluetoothCallbacks()
+  );
+
+  BLEService* service = bleServer->createService(
+    SERVICE_UUID
+  );
+
+  BLECharacteristic* characteristic =
+    service->createCharacteristic(
+      CHARACTERISTIC_UUID,
+      BLECharacteristic::PROPERTY_WRITE |
+      BLECharacteristic::PROPERTY_WRITE_NR
+    );
+
+  characteristic->setCallbacks(
+    new ComandoCallbacks()
+  );
+
+  service->start();
+
+  BLEAdvertising* advertising =
+    BLEDevice::getAdvertising();
+
+  advertising->addServiceUUID(SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->start();
+
+  Serial.println("[BLE] Bluetooth iniciado!");
+  Serial.println("[BLE] Nome: " BLE_NAME);
+}
+
+// ============================================
+// 11. SETUP
+// ============================================
 
 void setup() {
   Serial.begin(115200);
 
-  int pinos[] = {ENA, IN1, IN2, ENB, IN3, IN4};
-  for (int p : pinos) { pinMode(p, OUTPUT); digitalWrite(p, LOW); }
+  // Configura direcao dos motores
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
 
-  BLEDevice::init(NOME_BLE);
+  // Mantem os motores desabilitados
+  // durante a inicializacao
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  digitalWrite(ENA, LOW);
+  digitalWrite(ENB, LOW);
 
-  BLEServer* servidor = BLEDevice::createServer();
-  servidor->setCallbacks(new ServidorCallbacks());
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
 
-  BLEService* servico = servidor->createService(SERVICO_UUID);
-  BLECharacteristic* comando = servico->createCharacteristic(
-    COMANDO_UUID,
-    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+  // Configura PWM nos enables
+  bool pwmEsq = ledcAttach(
+    ENA,
+    PWM_FREQ,
+    PWM_RESOLUTION
   );
-  comando->setCallbacks(new ComandoCallbacks());
-  servico->start();
 
-  BLEDevice::getAdvertising()->setScanResponse(true);
-  BLEDevice::startAdvertising();
+  bool pwmDir = ledcAttach(
+    ENB,
+    PWM_FREQ,
+    PWM_RESOLUTION
+  );
 
-  Serial.println("Bluetooth pronto: procure \"" NOME_BLE "\" pelo app");
+  if (!pwmEsq || !pwmDir) {
+    Serial.println("[ERRO] Falha ao iniciar PWM");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  pararMotores();
+
+  Serial.println("==========================");
+  Serial.println(" EMPILHADEIRA ESP32-C3");
+  Serial.println("==========================");
+
+  iniciarBluetooth();
+
+  Serial.println("[SISTEMA] Aguardando conexao...");
 }
 
+// ============================================
+// 12. LOOP PRINCIPAL
+// ============================================
+
 void loop() {
-  // Segurança: sem comando recente, para tudo
-  if (millis() - ultimoComando > TIMEOUT_MS) {
-    dirigir(0, 0);
-  } else {
-    dirigir(cmdX / 100.0f, cmdY / 100.0f);
+
+  // Reinicia anuncio apos desconexao
+  if (reiniciarBluetooth && !bluetoothConectado) {
+    reiniciarBluetooth = false;
+
+    delay(100);
+    bleServer->startAdvertising();
+
+    Serial.println("[BLE] Aguardando reconexao...");
   }
 
-  // Desconectou: volta a anunciar para o app reconectar
-  if (!conectado && estavaConectado) {
-    delay(300);
-    BLEDevice::startAdvertising();
-    Serial.println("Desconectado - anunciando de novo");
+  // Sem Bluetooth: motores parados
+  if (!bluetoothConectado) {
+    pararMotores();
+    delay(10);
+    return;
   }
-  if (conectado && !estavaConectado) {
-    Serial.println("App conectado");
+
+  unsigned long agora = millis();
+
+  // Sem comandos recentes: parada automatica
+  if (ultimoComando == 0 ||
+      agora - ultimoComando > TIMEOUT_COMANDO) {
+
+    pararMotores();
+
+  } else {
+
+    // Executa o comando do joystick
+    controlarJoystick(
+      joystickX,
+      joystickY
+    );
   }
-  estavaConectado = conectado;
 
   delay(10);
-
-  // >>> Aqui pode entrar o envio de dados para a API, sem usar delay() longo <<<
 }
